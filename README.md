@@ -160,4 +160,20 @@ You could consider adding a suitable metric to the training loop yourself after 
 `pip install -e .`.
 
 ## Result
+* dataset: celeba
+* GaussianDiffusion
+    * image_size: 64
+    * timesteps: 1000
+    * sampling_timestep: 500 (ddim)
+        * ddpm의 2배 속도로 accelerate했다는 의미
+    * beta_schedule: linear (default = sigmoid)
+* Trainer
+    * train_batch_size: 32
+    * train_lr: 0.004
+    * train_num_steps: 100K
+    * gradient_accumulate_every: 2 (사실상 batch_size = 64를 simulation)
+    * ema_decay: 0.995
+    * num_fid_samples: 320
+
+실험 파일은 <code>'./ddpm_trainsample_exp.py'</code>에 있습니다.
 <img src="./images/sample-100-test.png" width="600px"><img>
