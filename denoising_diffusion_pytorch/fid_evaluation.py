@@ -95,6 +95,7 @@ class FIDEvaluation:
         self.sampler.eval()
         batches = num_to_groups(self.n_samples, self.batch_size)
         stacked_fake_features = []
+        # n_samples: 50000 16
         self.print_fn(
             f"Stacking Inception features for {self.n_samples} generated samples."
         )

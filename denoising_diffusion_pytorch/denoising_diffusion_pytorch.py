@@ -238,20 +238,23 @@ class LinearAttention(Module):
 class Attention(Module):
     def __init__(
         self,
-        dim,
-        heads = 4,
-        dim_head = 32,
-        num_mem_kv = 4,
-        flash = False
+        dim, # 입력 차원 수
+        heads = 4, # Multi-head Attention의 헤드 수
+        dim_head = 32, # 각 헤드의 차원
+        num_mem_kv = 4, # 메모리 키-값 개수
+        flash = False # flash Attention 사용 여부 -> 하드웨어 단에서 attention연산을 더 빠르게
     ):
         super().__init__()
         self.heads = heads
         hidden_dim = dim_head * heads
 
         self.norm = RMSNorm(dim)
+        # 일반적인 softmax(QK^T)V 연산산
         self.attend = Attend(flash = flash)
 
         self.mem_kv = nn.Parameter(torch.randn(2, heads, num_mem_kv, dim_head))
+
+        # dim -> hidden_dim * 3
         self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias = False)
         self.to_out = nn.Conv2d(hidden_dim, dim, 1)
 
@@ -261,9 +264,12 @@ class Attention(Module):
         x = self.norm(x)
 
         qkv = self.to_qkv(x).chunk(3, dim = 1)
+        # (batch, head * dim_head, height, width) -> (batch, heads, height * width, dim_head)
         q, k, v = map(lambda t: rearrange(t, 'b (h c) x y -> b h (x y) c', h = self.heads), qkv)
 
+        # mmem_mv [2, heads, num_mem_kv, dim_head] -> [batch, heads, num_mem_kv, dim_head]
         mk, mv = map(lambda t: repeat(t, 'h n d -> b h n d', b = b), self.mem_kv)
+        # [batch, heads, (num_mem_kv + image_patches), dim_head]
         k, v = map(partial(torch.cat, dim = -2), ((mk, k), (mv, v)))
 
         out = self.attend(q, k, v)
@@ -301,9 +307,12 @@ class Unet(Module):
         self.self_condition = self_condition
         input_channels = channels * (2 if self_condition else 1)
 
+        # init_dim이 없으면 dim으로 
         init_dim = default(init_dim, dim)
         self.init_conv = nn.Conv2d(input_channels, init_dim, 7, padding = 3)
 
+        # [dim, dim, dim * (dim_mults)[0], dim * (dim_mults)[1], ..., (dim_mults)[len(dim_mults) - 1]]
+        # [64, 64, 128, 256, 512]
         dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
 
@@ -313,6 +322,7 @@ class Unet(Module):
 
         self.random_or_learned_sinusoidal_cond = learned_sinusoidal_cond or random_fourier_features
 
+        # time embedding(positional encoding)을 위한 SinusoidalPosEmb 생성.
         if self.random_or_learned_sinusoidal_cond:
             sinu_pos_emb = RandomOrLearnedSinusoidalPosEmb(learned_sinusoidal_dim, random_fourier_features)
             fourier_dim = learned_sinusoidal_dim + 1
@@ -320,6 +330,7 @@ class Unet(Module):
             sinu_pos_emb = SinusoidalPosEmb(dim, theta = sinusoidal_pos_emb_theta)
             fourier_dim = dim
 
+        # 선언한 sinu_pos_emb를 time_mlp에 추가 --> Linear --> GELU --> Linear
         self.time_mlp = nn.Sequential(
             sinu_pos_emb,
             nn.Linear(fourier_dim, time_dim),
@@ -350,6 +361,8 @@ class Unet(Module):
         self.ups = ModuleList([])
         num_resolutions = len(in_out)
 
+
+        # Down-sampling (downs)
         for ind, ((dim_in, dim_out), layer_full_attn, layer_attn_heads, layer_attn_dim_head) in enumerate(zip(in_out, full_attn, attn_heads, attn_dim_head)):
             is_last = ind >= (num_resolutions - 1)
 
@@ -362,11 +375,13 @@ class Unet(Module):
                 Downsample(dim_in, dim_out) if not is_last else nn.Conv2d(dim_in, dim_out, 3, padding = 1)
             ]))
 
+        # Mid block
         mid_dim = dims[-1]
         self.mid_block1 = resnet_block(mid_dim, mid_dim)
         self.mid_attn = FullAttention(mid_dim, heads = attn_heads[-1], dim_head = attn_dim_head[-1])
         self.mid_block2 = resnet_block(mid_dim, mid_dim)
 
+        # Up-sampling (ups)
         for ind, ((dim_in, dim_out), layer_full_attn, layer_attn_heads, layer_attn_dim_head) in enumerate(zip(*map(reversed, (in_out, full_attn, attn_heads, attn_dim_head)))):
             is_last = ind == (len(in_out) - 1)
 
@@ -388,7 +403,8 @@ class Unet(Module):
     @property
     def downsample_factor(self):
         return 2 ** (len(self.downs) - 1)
-
+    
+    # DDPM의 reverse process과정
     def forward(self, x, time, x_self_cond = None):
         assert all([divisible_by(d, self.downsample_factor) for d in x.shape[-2:]]), f'your input dimensions {x.shape[-2:]} need to be divisible by {self.downsample_factor}, given the unet'
 
@@ -430,6 +446,8 @@ class Unet(Module):
         x = torch.cat((x, r), dim = 1)
 
         x = self.final_res_block(x, t)
+
+        # 해당 값이 predicted noise값값
         return self.final_conv(x)
 
 # gaussian diffusion trainer class
@@ -460,17 +478,25 @@ def cosine_beta_schedule(timesteps, s = 0.008):
     betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
     return torch.clip(betas, 0, 0.999)
 
+
+# 논문에서의 beta schedule
 def sigmoid_beta_schedule(timesteps, start = -3, end = 3, tau = 1, clamp_min = 1e-5):
     """
     sigmoid schedule
     proposed in https://arxiv.org/abs/2212.11972 - Figure 8
     better for images > 64x64, when used during training
     """
+
+    # alpha cumprod가 부드럽게 변하게 해주는 beta schedule 방식임
+    # 예를들어 후반부에서는 천천히 변화해서 역방향 복원이 쉬워짐
     steps = timesteps + 1
     t = torch.linspace(0, timesteps, steps, dtype = torch.float64) / timesteps
+
+    # 시그모이드로 변환된 시작값과 끝값을 구함
     v_start = torch.tensor(start / tau).sigmoid()
     v_end = torch.tensor(end / tau).sigmoid()
-    alphas_cumprod = (-((t * (end - start) + start) / tau).sigmoid() + v_end) / (v_end - v_start)
+
+    alphas_cumprod = (-(( t * (end - start) + start ) / tau).sigmoid() + v_end) / (v_end - v_start)
     alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
     betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
     return torch.clip(betas, 0, 0.999)
@@ -511,6 +537,8 @@ class GaussianDiffusion(Module):
 
         assert objective in {'pred_noise', 'pred_x0', 'pred_v'}, 'objective must be either pred_noise (predict noise) or pred_x0 (predict image start) or pred_v (predict v [v-parameterization as defined in appendix D of progressive distillation paper, used in imagen-video successfully])'
 
+
+        # beta schedule 하는 곳
         if beta_schedule == 'linear':
             beta_schedule_fn = linear_beta_schedule
         elif beta_schedule == 'cosine':
@@ -522,8 +550,12 @@ class GaussianDiffusion(Module):
 
         betas = beta_schedule_fn(timesteps, **schedule_fn_kwargs)
 
+        # alpha값 정의
         alphas = 1. - betas
+
+        # alpha_cumprod 정의의
         alphas_cumprod = torch.cumprod(alphas, dim=0)
+        # 벡터의 맨 앞에 1을 추가 --> alpha_cumprod_{t-1} = [1, alpha_cumprod_{1}, alpha_cumprod_{2},... ,alpha_cumprod_{t-2}]
         alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value = 1.)
 
         timesteps, = betas.shape
@@ -613,10 +645,13 @@ class GaussianDiffusion(Module):
             (extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - x0) / \
             extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
         )
-
+    
+    
     def predict_v(self, x_start, t, noise):
         return (
+            # α_t * noise (ϵ) -
             extract(self.sqrt_alphas_cumprod, t, x_start.shape) * noise -
+            # √(1 - α_t) * x_0
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * x_start
         )
 
@@ -633,6 +668,8 @@ class GaussianDiffusion(Module):
         )
         posterior_variance = extract(self.posterior_variance, t, x_t.shape)
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
+
+        
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
     def model_predictions(self, x, t, x_self_cond = None, clip_x_start = False, rederive_pred_noise = False):
@@ -670,61 +707,92 @@ class GaussianDiffusion(Module):
         model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start = x_start, x_t = x, t = t)
         return model_mean, posterior_variance, posterior_log_variance, x_start
 
+    # 현재 시간 t에서 x_t -> x_t-1을 샘플링
     @torch.inference_mode()
     def p_sample(self, x, t: int, x_self_cond = None):
+        # 현재 배치 크기와 디바이스를 가져옴
         b, *_, device = *x.shape, self.device
+
+        # 모든 배치에대해 현재 t값을 동일한 형태로 변환해줌
         batched_times = torch.full((b,), t, device = device, dtype = torch.long)
-        model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, x_self_cond = x_self_cond, clip_denoised = True)
+
+        # 모델이 예측한 x_t-1의 평균값과 분산을 활용
+        model_mean, _, model_log_variance, x_start = self.p_mean_variance(
+            x = x, t = batched_times, x_self_cond = x_self_cond, clip_denoised = True)
         noise = torch.randn_like(x) if t > 0 else 0. # no noise if t == 0
+
+        # x_t-1샘플링을 mu + sigma * noise 형식으로 진행함
         pred_img = model_mean + (0.5 * model_log_variance).exp() * noise
         return pred_img, x_start
 
+    # sampling
     @torch.inference_mode()
     def p_sample_loop(self, shape, return_all_timesteps = False):
         batch, device = shape[0], self.device
 
+        # x_T는 랜덤 가우시안 노이즈
         img = torch.randn(shape, device = device)
         imgs = [img]
 
         x_start = None
-
+        # t를 역순으로 시작해서 x_0까지 점진적으로 샘플을 복원
         for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps):
+            
+            # self-cond가 켜져있으면, 이전의 x_start값을 다음 단계의 추가 입력으로 사용
             self_cond = x_start if self.self_condition else None
             img, x_start = self.p_sample(img, t, self_cond)
             imgs.append(img)
 
         ret = img if not return_all_timesteps else torch.stack(imgs, dim = 1)
 
+        # 데이터를 [0, 1]범위로 변환 (DDM 학습시에 [-1, 1]범위로 학습했음)
         ret = self.unnormalize(ret)
         return ret
 
+    # ddim은 deterministic하게 sampling가능
     @torch.inference_mode()
     def ddim_sample(self, shape, return_all_timesteps = False):
+        # eta: stochasticity조절 변수 (0이면 DDPM과 동일), objective: 모델이 예측하는 대상(pred_x0, pred_noise, pred_v...)
         batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
 
+        
+        # ex) T=1000, sampling_timesteps=50 --> time_pairs [(999, 980), (880, 960), ..., (40, 20), (20, 0)]
         times = torch.linspace(-1, total_timesteps - 1, steps = sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
         times = list(reversed(times.int().tolist()))
         time_pairs = list(zip(times[:-1], times[1:])) # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
 
+        # img는 gaussian noise로 시작
         img = torch.randn(shape, device = device)
         imgs = [img]
 
+        # self-conditioning도 가능
         x_start = None
 
         for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
             time_cond = torch.full((batch,), time, device = device, dtype = torch.long)
+            # self-conditioning이 활성화되면, 이전에 예측한 x_0을 현재 스텝에서 입력으로 활용
             self_cond = x_start if self.self_condition else None
+
+            # model이 x_t로부터 x_0과 noise를 예측
             pred_noise, x_start, *_ = self.model_predictions(img, time_cond, self_cond, clip_x_start = True, rederive_pred_noise = True)
 
+            # 마지막 timestep에서는 x_0을 직접 반환
             if time_next < 0:
                 img = x_start
                 imgs.append(img)
                 continue
-
+            
+            # 𝛼_t
             alpha = self.alphas_cumprod[time]
+            # 𝛼_t-1
             alpha_next = self.alphas_cumprod[time_next]
 
+            # sigma를 아래와같이 설정하면 forward-process가 Markovian이 되어 generative(reverse-process)가 DDPM이 된다.
+            # sigma = 0이면 x_t-1, x_0에 대하여 forward process가 deterministic DDIM이 된다.
+            # 참고 (DDPM의 목적함수로 학습된 implicit probablistic model이기 때문에 DDIM이라 부른다.)
             sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
+
+            # 스케일링 계수 (Noise term을 조절)
             c = (1 - alpha_next - sigma ** 2).sqrt()
 
             noise = torch.randn_like(img)
@@ -799,7 +867,7 @@ class GaussianDiffusion(Module):
             noise += offset_noise_strength * rearrange(offset_noise, 'b c -> b c 1 1')
 
         # noise sample
-
+        # sampling한 t를 활용해 x_t (noise)를 만듬
         x = self.q_sample(x_start = x_start, t = t, noise = noise)
 
         # if doing self-conditioning, 50% of the time, predict x_start from current set of times
@@ -807,6 +875,7 @@ class GaussianDiffusion(Module):
         # this technique will slow down training by 25%, but seems to lower FID significantly
 
         x_self_cond = None
+        # 이전 결괏값을 다시 넣어주기 위함
         if self.self_condition and random() < 0.5:
             with torch.no_grad():
                 x_self_cond = self.model_predictions(x, t).pred_x_start
@@ -817,27 +886,39 @@ class GaussianDiffusion(Module):
         model_out = self.model(x, t, x_self_cond)
 
         if self.objective == 'pred_noise':
-            target = noise
+            target = noise # x_0 (원본 이미지)를 direct로 예측
         elif self.objective == 'pred_x0':
-            target = x_start
+            target = x_start # pred_v가 default이다다
         elif self.objective == 'pred_v':
             v = self.predict_v(x_start, t, noise)
             target = v
         else:
             raise ValueError(f'unknown objective {self.objective}')
 
+        # MSE로 target과 model_out과 비교
+        # 아마 model도 target에 따라 다른 output을 내보내게 했을거임.
         loss = F.mse_loss(model_out, target, reduction = 'none')
+        # batch차원 빼고 싹다 평균냄
         loss = reduce(loss, 'b ... -> b', 'mean')
 
+        # SNR을 이용해 신호가 강할때(초기 노이즈가 적을때) 높은 가중치를 부여
+        # 예측이 쉬운 영역에서는 큰 Loss weight를 줘 모델이 정밀하게 학습하도록 유도함
         loss = loss * extract(self.loss_weight, t, loss.shape)
         return loss.mean()
+
+
 
     def forward(self, img, *args, **kwargs):
         b, c, h, w, device, img_size, = *img.shape, img.device, self.image_size
         assert h == img_size[0] and w == img_size[1], f'height and width of image must be {img_size}'
+
+        # image의 batchsize만큼 t를 추출한다 
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
 
+        # normalize할때 img를 [-1, 1]범위로 놓고 학습을 한다.
         img = self.normalize(img)
+
+        # t값을 정규화된 image와 함꼐 reverse_process에 넣어준다.
         return self.p_losses(img, t, *args, **kwargs)
 
 # dataset classes
@@ -863,7 +944,7 @@ class Dataset(Dataset):
             T.Resize(image_size),
             T.RandomHorizontalFlip() if augment_horizontal_flip else nn.Identity(),
             T.CenterCrop(image_size),
-            T.ToTensor()
+            T.ToTensor() # 범위를 0~1로 바꿔주는 역할도함 --> [-1, 1] (norm, train) --> [0, 1] (unorm, sample)
         ])
 
     def __len__(self):
@@ -884,7 +965,7 @@ class Trainer:
         *,
         train_batch_size = 16,
         gradient_accumulate_every = 1,
-        augment_horizontal_flip = True,
+        augment_horizontal_flip = True, # 이미지가 확률적으로 좌우반전 됨.
         train_lr = 1e-4,
         train_num_steps = 100000,
         ema_update_every = 10,
@@ -956,6 +1037,7 @@ class Trainer:
         # for logging results in a folder periodically
 
         if self.accelerator.is_main_process:
+            # diffusion_model의 가중치를 부드럽게 업데이트 해주기 위함
             self.ema = EMA(diffusion_model, beta = ema_decay, update_every = ema_update_every)
             self.ema.to(self.device)
 
@@ -1051,48 +1133,67 @@ class Trainer:
 
                 total_loss = 0.
 
+                # gradient_accumulate는 batch_Size가 큰 것을 simulation하기 위해 사용됨.
                 for _ in range(self.gradient_accumulate_every):
+                    # dataloader에서 한 배치의 데이터를 가져와서 GPU로 이동
                     data = next(self.dl).to(device)
 
+                    # AMP를 사용하여 FP16연산을 자동으로 수행해주도록 해주는 함수
                     with self.accelerator.autocast():
                         loss = self.model(data)
+                        # gradient_accumulate_every만큼의 가중치를 한번만 update해야하므로
                         loss = loss / self.gradient_accumulate_every
                         total_loss += loss.item()
-
+                    
+                    # FP16, multi-GPU, gradient-accumulation을 자동처리하면서 역전파
                     self.accelerator.backward(loss)
 
+                # loss를 step1개 마다 보여줌
                 pbar.set_description(f'loss: {total_loss:.4f}')
 
                 accelerator.wait_for_everyone()
+                # gradient cliping을 통해 gradient를 normalization해서 학습 안정성을 높임
                 accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
                 self.opt.step()
+                # optimizer의 그래디언트 값을 초기화 하는 역할
                 self.opt.zero_grad()
 
                 accelerator.wait_for_everyone()
 
                 self.step += 1
+
+
                 if accelerator.is_main_process:
                     self.ema.update()
 
+                    # 일정한 step마다 sampling 및 모델 저장을 실행하는 역할
                     if self.step != 0 and divisible_by(self.step, self.save_and_sample_every):
+                        # ema를 비활성화
                         self.ema.ema_model.eval()
 
+                        # autograd끔 (메모리 최적화)
                         with torch.inference_mode():
                             milestone = self.step // self.save_and_sample_every
+                            # 샘플을 여러 배치로 나누는 과정
                             batches = num_to_groups(self.num_samples, self.batch_size)
+                            
+                            # sample을 수행 --> p_sample_loop()
                             all_images_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n), batches))
 
                         all_images = torch.cat(all_images_list, dim = 0)
 
+                        # 25개 이미지만 sampling하는 것임
                         utils.save_image(all_images, str(self.results_folder / f'sample-{milestone}.png'), nrow = int(math.sqrt(self.num_samples)))
 
                         # whether to calculate fid
 
+                        # FID 계산 -> 실제 이미지와 생성된 이미지가 얼마나 유사한지 평가
                         if self.calculate_fid:
-                            fid_score = self.fid_scorer.fid_score()
+                            fid_score = self.fid_scorer.fid_score() # *********병목**********
                             accelerator.print(f'fid_score: {fid_score}')
 
+                        # FID 기준으로 이전보다 좋으면 best model로서 저장
                         if self.save_best_and_latest_only:
                             if self.best_fid > fid_score:
                                 self.best_fid = fid_score
